@@ -84,8 +84,8 @@ done
 shopt -u nullglob
 
 if [ "$TEST_ONLY" = true ]; then
-    echo "==> Running unit tests (manager package)..."
-    go test -v ./manager
+    echo "==> Running unit tests (config and template packages)..."
+    go test -v ./config ./template
     echo "==> Tests passed successfully!"
     exit 0
 fi

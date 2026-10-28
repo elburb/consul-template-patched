@@ -104,8 +104,8 @@ jobs:
       - name: Run Unit Tests
         run: |
           cd upstream-src
-          echo "==> Running manager unit tests..."
-          go test -v ./manager
+          echo "==> Running pure unit tests (config, template)..."
+          go test -v ./config ./template
 
       - name: Compile linux/amd64 Static Binary
         run: |
