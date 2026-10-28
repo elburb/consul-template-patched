@@ -1,0 +1,146 @@
+name: Upstream Sync & Patched Release
+
+on:
+  schedule:
+    - cron: '0 6 * * *'  # Daily check at 06:00 UTC
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: 'Specific upstream tag to build (leave empty to detect latest)'
+        required: false
+        default: ''
+      force_rebuild:
+        description: 'Rebuild even if release already exists'
+        type: boolean
+        default: false
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  check-upstream:
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      upstream_tag: ${{ steps.check.outputs.upstream_tag }}
+      release_tag: ${{ steps.check.outputs.release_tag }}
+    steps:
+      - name: Check Upstream and Local Releases
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_TAG: ${{ github.event.inputs.upstream_tag }}
+          FORCE_BUILD: ${{ github.event.inputs.force_rebuild }}
+        run: |
+          set -euo pipefail
+
+          # 1. Determine target upstream tag
+          if [ -n "$INPUT_TAG" ]; then
+            UPSTREAM_TAG="$INPUT_TAG"
+          else
+            UPSTREAM_TAG=$(gh api repos/hashicorp/consul-template/releases/latest --jq .tag_name)
+          fi
+          
+          RELEASE_TAG="${UPSTREAM_TAG}-p.elburb"
+          echo "Target upstream tag: $UPSTREAM_TAG"
+          echo "Target release tag:  $RELEASE_TAG"
+
+          # 2. Check if release already exists in this repository
+          EXISTS=false
+          if gh release view "$RELEASE_TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            EXISTS=true
+            echo "Release $RELEASE_TAG already exists."
+          else
+            echo "Release $RELEASE_TAG does not exist yet."
+          fi
+
+          if [ "$EXISTS" = "false" ] || [ "$FORCE_BUILD" = "true" ]; then
+            echo "==> Build required for $RELEASE_TAG"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "==> Upstream is unchanged; skipping build."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "upstream_tag=$UPSTREAM_TAG" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+
+  build-and-release:
+    needs: check-upstream
+    if: needs.check-upstream.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    env:
+      UPSTREAM_TAG: ${{ needs.check-upstream.outputs.upstream_tag }}
+      RELEASE_TAG: ${{ needs.check-upstream.outputs.release_tag }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout Orchestration Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Go Toolchain
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: 'none'
+          go-version: '1.24'
+
+      - name: Clone Upstream consul-template
+        run: |
+          echo "==> Cloning hashicorp/consul-template at ${UPSTREAM_TAG}..."
+          git clone --depth 1 --branch "$UPSTREAM_TAG" https://github.com/hashicorp/consul-template.git upstream-src
+
+      - name: Apply Patches
+        run: |
+          cd upstream-src
+          shopt -s nullglob
+          for p in ../patches/*.patch; do
+            echo "==> Applying patch: $(basename "$p")..."
+            git apply "$p"
+          done
+          shopt -u nullglob
+
+      - name: Run Unit Tests
+        run: |
+          cd upstream-src
+          echo "==> Running manager unit tests..."
+          go test -v ./manager
+
+      - name: Compile linux/amd64 Static Binary
+        run: |
+          cd upstream-src
+          GIT_COMMIT=$(git rev-parse --short HEAD || echo "patched")
+          OUTPUT_NAME="consul-template_${RELEASE_TAG}_linux_amd64"
+
+          echo "==> Compiling static binary (CGO_ENABLED=0)..."
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+            -trimpath \
+            -ldflags "-s -w -X github.com/hashicorp/consul-template/version.GitCommit=${GIT_COMMIT} -X github.com/hashicorp/consul-template/version.Version=${UPSTREAM_TAG}" \
+            -o "../${OUTPUT_NAME}" \
+            .
+
+          cd ..
+          chmod +x "${OUTPUT_NAME}"
+          "./${OUTPUT_NAME}" -v
+
+      - name: Package Release Assets
+        run: |
+          OUTPUT_NAME="consul-template_${RELEASE_TAG}_linux_amd64"
+          ARCHIVE_NAME="${OUTPUT_NAME}.tar.gz"
+
+          # Create a copy named 'consul-template' inside archive for convenient extraction
+          cp -p "${OUTPUT_NAME}" consul-template
+          tar -czvf "${ARCHIVE_NAME}" consul-template
+          sha256sum "${ARCHIVE_NAME}" > "${ARCHIVE_NAME}.sha256"
+
+      - name: Publish GitHub Release
+        run: |
+          OUTPUT_NAME="consul-template_${RELEASE_TAG}_linux_amd64"
+          ARCHIVE_NAME="${OUTPUT_NAME}.tar.gz"
+
+          gh release create "$RELEASE_TAG" \
+            --title "consul-template $RELEASE_TAG" \
+            --notes "Patched build of upstream \`hashicorp/consul-template@${UPSTREAM_TAG}\` with PR #2059 applied (fixes Vault token watcher deadlock on unconsumed \`ServerErrCh\`)." \
+            "${ARCHIVE_NAME}" \
+            "${ARCHIVE_NAME}.sha256"

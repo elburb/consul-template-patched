@@ -1,0 +1,7 @@
+# Local build cache and binaries
+.build/
+bin/
+upstream-src/
+consul-template
+*.tar.gz
+*.sha256

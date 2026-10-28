@@ -1,0 +1,38 @@
+From 88999c55b10ac8a2eab52ee4dd5a7ffb6768771d Mon Sep 17 00:00:00 2001
+From: ShayaSi <shaya.sisskind@gmail.com>
+Date: Thu, 8 May 2025 14:04:15 +0200
+Subject: [PATCH] Add missing consumer for ServerErrCh in vaultTokenWatcher
+
+r.vaultTokenWatcher.ServerErrCh was missing from runner loop. This caused
+view to hang if this channel was used, which is the case of an error,
+preventing retries from executing.
+
+Fixes #2058
+---
+ manager/runner.go | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/manager/runner.go b/manager/runner.go
+index de810770f..a06d5bfae 100644
+--- a/manager/runner.go
++++ b/manager/runner.go
+@@ -473,6 +473,17 @@ func (r *Runner) Start() {
+ 			log.Printf("[ERR] (runner): %s", err)
+ 			r.ErrCh <- err
+ 			return
++		case err := <-r.vaultTokenWatcher.ServerErrCh():
++			// If we got a server error we push the error up the stack
++			log.Printf("[ERR] (runner) sending server error back to caller")
++			// Drain the error channel if anything already exists
++			select {
++			case <-r.ServerErrCh:
++				continue
++			default:
++			}
++			r.ServerErrCh <- err
++			goto OUTER
+ 
+ 		case tmpl := <-r.quiescenceCh:
+ 			// Remove the quiescence for this template from the map. This will force
+-- 
+2.47.3
